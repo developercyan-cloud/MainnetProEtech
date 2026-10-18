@@ -144,7 +144,7 @@ app.get("/", (_req, res) => res.json({
   network: "isolated-ethereum-mainnet-fork",
   usdt: USDT,
   warning: "TEST NETWORK ONLY. Fork balances are not real or transferable USDT.",
-  endpoints: { rpc: "/rpc", health: "/health", admin: "/admin/fund-usdt" }
+  endpoints: { rpc: "/rpc", health: "/health", admin: "/admin/fund-usdt", transfer: "/admin/transfer-usdt" }
 }));
 
 app.get("/health", async (_req, res) => {
@@ -220,6 +220,86 @@ async function tokenBalanceRaw(address) {
   const data = "0x70a08231" + address.slice(2).toLowerCase().padStart(64, "0");
   return BigInt(await rpc("eth_call", [{ to: USDT, data }, "latest"]));
 }
+
+app.post("/admin/transfer-usdt", adminLimiter, requireAdmin, async (req, res) => {
+  let impersonating = false;
+  try {
+    const { fromAddress, toAddress, amount, chainId } = req.body || {};
+    if (CHAIN_ID !== 1 || Number(chainId) !== 1) {
+      return res.status(409).json({ error: "This endpoint only permits test transfers on the configured Chain ID 1 fork." });
+    }
+    if (!isAddress(fromAddress) || !isAddress(toAddress)) {
+      return res.status(400).json({ error: "Invalid sender or recipient Ethereum address" });
+    }
+    const from = fromAddress.toLowerCase();
+    const to = toAddress.toLowerCase();
+    const amountRaw = amountRawGuard(amount);
+    if (amountRaw <= 0n) return res.status(400).json({ error: "Transfer amount must be greater than zero" });
+
+    // Verify the source has the requested virtual USDT balance before impersonation.
+    const balanceBefore = await tokenBalanceRaw(from);
+    if (balanceBefore < amountRaw) {
+      return res.status(400).json({ error: "Insufficient virtual USDT balance on the MainNet Lab fork" });
+    }
+
+    // Ensure gas exists only in the isolated Anvil state. This never changes Ethereum Mainnet.
+    const nativeBefore = BigInt(await rpc("eth_getBalance", [from, "latest"]));
+    if (nativeBefore < 10n ** 16n) {
+      await rpc("anvil_setBalance", [from, hexWord(5n * 10n ** 18n)]);
+    }
+
+    const data = "0xa9059cbb" + to.slice(2).padStart(64, "0") + amountRaw.toString(16).padStart(64, "0");
+    await rpc("anvil_impersonateAccount", [from]);
+    impersonating = true;
+    const gasPrice = await rpc("eth_gasPrice", []);
+    const txHash = await rpc("eth_sendTransaction", [{
+      from,
+      to: USDT,
+      data,
+      value: "0x0",
+      gas: "0x186a0",
+      gasPrice
+    }]);
+    if (typeof txHash !== "string" || !/^0x[0-9a-fA-F]{64}$/.test(txHash)) {
+      throw new Error("Anvil returned an invalid transaction hash");
+    }
+    const receipt = await rpc("eth_getTransactionReceipt", [txHash]);
+    if (!receipt || receipt.status !== "0x1") {
+      throw new Error("USDT transfer failed on the Anvil fork; receipt status was not successful");
+    }
+    const transferTopic = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+    const expectedFromTopic = "0x" + from.slice(2).padStart(64, "0");
+    const expectedToTopic = "0x" + to.slice(2).padStart(64, "0");
+    const validLog = (receipt.logs || []).some(log =>
+      String(log.address || "").toLowerCase() === USDT.toLowerCase() &&
+      String(log.topics?.[0] || "").toLowerCase() === transferTopic &&
+      String(log.topics?.[1] || "").toLowerCase() === expectedFromTopic &&
+      String(log.topics?.[2] || "").toLowerCase() === expectedToTopic &&
+      BigInt(log.data || "0x0") === amountRaw
+    );
+    if (!validLog) throw new Error("Receipt did not contain the exact expected USDT Transfer event");
+
+    res.json({
+      ok: true,
+      network: "ProEshop MainNet Lab Anvil fork only",
+      chainId: CHAIN_ID,
+      fromAddress: from,
+      toAddress: to,
+      token: USDT,
+      amount: String(amount),
+      txHash,
+      blockNumber: receipt.blockNumber,
+      warning: "Test-only transfer on an isolated fork. No real USDT was sent on Ethereum Mainnet."
+    });
+  } catch (err) {
+    res.status(400).json({ error: String(err.message || "Fork transfer failed").slice(0, 400) });
+  } finally {
+    if (impersonating) {
+      try { await rpc("anvil_stopImpersonatingAccount", [String(req.body?.fromAddress || "").toLowerCase()]); }
+      catch (err) { console.error("Could not stop Anvil account impersonation:", err.message); }
+    }
+  }
+});
 
 app.post("/admin/fund-usdt", adminLimiter, requireAdmin, async (req, res) => {
   try {
