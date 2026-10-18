@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MainNet Lab · Uniswap V3 Test</title>
+<style>
+:root{color-scheme:dark;--bg:#090b12;--panel:#121725;--line:#29344c;--muted:#a0abc0;--text:#f4f6ff;--accent:#8c7bff;--good:#48d6a2;--warn:#ffd078;--bad:#ff8181}
+*{box-sizing:border-box}body{margin:0;background:radial-gradient(ellipse at top,#1b1b3d 0,#090b12 55%);font:15px/1.5 system-ui,sans-serif;color:var(--text)}main{max-width:780px;margin:auto;padding:24px 15px 44px}.eyebrow{font-size:12px;letter-spacing:.16em;text-transform:uppercase;color:#b9b0ff;font-weight:800}h1{font-size:clamp(28px,5vw,40px);line-height:1.1;margin:8px 0}p{color:var(--muted);margin:8px 0 0}.card{background:rgba(18,23,37,.96);border:1px solid var(--line);border-radius:18px;padding:17px;margin-top:15px;box-shadow:0 12px 36px #0003}.row{display:flex;gap:10px;align-items:center;justify-content:space-between;flex-wrap:wrap}.pill{border:1px solid var(--line);border-radius:99px;padding:4px 9px;font-size:12px;color:var(--muted)}label{display:block;color:#bdc6d8;font-size:13px;margin:13px 0 6px}input{width:100%;background:#0a101b;border:1px solid #34405a;border-radius:11px;padding:12px;color:var(--text);font:inherit}button{border:0;border-radius:11px;padding:12px 15px;background:linear-gradient(135deg,#7767ff,#a06cff);color:white;font-weight:750;cursor:pointer}button.secondary{background:#20283a;border:1px solid #35425d}button.danger{background:#40252d;border:1px solid #77424c}button:disabled{opacity:.45;cursor:not-allowed}.status{margin-top:11px;padding:11px 12px;border:1px solid var(--line);background:#0a101b;border-radius:11px;overflow-wrap:anywhere}.good{color:var(--good)}.warn{color:var(--warn)}.bad{color:var(--bad)}.grid{display:grid;grid-template-columns:1fr 1fr;gap:11px}.metric{background:#0a101b;border:1px solid #202a40;border-radius:12px;padding:13px;min-width:0}.metric small{display:block;color:var(--muted)}.metric strong{display:block;font-size:18px;overflow-wrap:anywhere;margin-top:4px}code{color:#d8d1ff;overflow-wrap:anywhere}.note{font-size:13px}.foot{font-size:12px;color:#78859c;margin-top:16px}@media(max-width:520px){.grid{grid-template-columns:1fr}.card{padding:14px}}
+</style></head>
+<body><main>
+<div class="eyebrow">MainNet Lab · independiente de ProEshop</div>
+<h1>Uniswap V3<br>Prueba controlada</h1>
+<p>Consulta cotizaciones y, si lo decides, solicita a MetaMask una aprobación limitada y un intercambio. No se almacenan claves ni frases semilla.</p>
+
+<section class="card">
+<div class="row"><strong>1 · Conexión</strong><span class="pill">RPC Railway</span></div>
+<label for="rpc">URL RPC</label><input id="rpc" value="https://mainnetproetech-production.up.railway.app/rpc">
+<div class="row" style="margin-top:12px"><button id="connect">Conectar MetaMask</button><button id="check" class="secondary">Comprobar RPC</button></div>
+<div id="conn" class="status">Aún no conectada.</div>
+</section>
+
+<section class="card">
+<div class="row"><strong>2 · Cotización</strong><span class="pill">USDT → WETH · V3 fee 0,3%</span></div>
+<label for="amount">Cantidad USDT</label><input id="amount" type="number" min="0.000001" step="any" value="1">
+<label for="slippage">Deslizamiento máximo</label>
+<select id="slippage" style="width:100%;background:#0a101b;border:1px solid #34405a;border-radius:11px;padding:12px;color:var(--text);font:inherit">
+<option value="50">0,5%</option><option value="100" selected>1%</option><option value="300">3%</option>
+</select>
+<div class="row" style="margin-top:12px"><button id="quote">Consultar cotización</button></div>
+<div id="qstatus" class="status">Sin cotización todavía.</div>
+<div class="grid" style="margin-top:11px"><div class="metric"><small>Salida estimada</small><strong id="out">—</strong></div><div class="metric"><small>Salida mínima calculada</small><strong id="minout">—</strong></div></div>
+</section>
+
+<section class="card">
+<div class="row"><strong>3 · Aprobar solo la cantidad elegida</strong><span class="pill">No ilimitada</span></div>
+<p class="note">La aprobación permite al router gastar como máximo la cantidad USDT indicada en el campo anterior. Requiere una firma explícita en MetaMask.</p>
+<button id="approve" style="margin-top:12px">Aprobar cantidad exacta</button>
+<div id="astatus" class="status">Aún no se ha solicitado ninguna aprobación.</div>
+</section>
+
+<section class="card">
+<div class="row"><strong>4 · Ejecutar intercambio</strong><span class="pill">Firma explícita</span></div>
+<p class="note">Solo se habilita tras una cotización reciente y una aprobación suficiente. MetaMask mostrará una confirmación antes de enviar la transacción.</p>
+<button id="swap" class="danger" style="margin-top:12px" disabled>Intercambiar USDT → WETH</button>
+<div id="sstatus" class="status">Intercambio deshabilitado hasta completar los pasos anteriores.</div>
+</section>
+
+<section class="card">
+<strong>Contratos</strong>
+<p class="note">USDT: <code>0xdAC17F958D2ee523a2206206994597C13D831ec7</code></p>
+<p class="note">WETH: <code>0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2</code></p>
+<p class="note">Quoter V2: <code>0x61fFE014bA17989E743c5F6cB21bF9697530B21e</code></p>
+<p class="note">SwapRouter02: <code>0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45</code></p>
+<div class="status warn"><strong>Advertencia crítica:</strong> este RPC usa Chain ID 1, igual que Ethereum Mainnet. Usa únicamente una cuenta de pruebas sin fondos ni activos reales en Mainnet. Una transacción firmada con Chain ID 1 puede ser reproducible en la red principal. Comprueba en MetaMask que la red seleccionada usa el RPC de Railway antes de firmar. Si tienes cualquier duda, no firmes.</div>
+</section>
+<div class="foot">MainNet Lab · archivo local. No envía transacciones sin una acción explícita del usuario.</div>
+</main>
+<script>
+(()=> {
+const $=id=>document.getElementById(id);
+const USDT='0xdAC17F958D2ee523a2206206994597C13D831ec7';
+const WETH='0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2';
+const QUOTER='0x61fFE014bA17989E743c5F6cB21bF9697530B21e';
+const ROUTER='0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45';
+const QUOTE_SEL='0xc6a5026a', APPROVE_SEL='0x095ea7b3', SWAP_SEL='0x04e45aaf';
+let account=null, quoteRaw=null, quoteAmountRaw=null, quoteAt=0, approvalAmountRaw=0n;
+const pad=h=>h.replace(/^0x/i,'').padStart(64,'0');
+const addr=a=>pad(a.toLowerCase().replace(/^0x/,''));
+const hex=n=>'0x'+BigInt(n).toString(16);
+function units(raw,d){let n=BigInt(raw),b=10n**BigInt(d),w=n/b,f=(n%b).toString().padStart(d,'0').replace(/0+$/,'');return w.toString()+(f?'.'+f:'')}
+function parseUnits(v,d){let s=String(v).trim();if(!/^\d+(\.\d+)?$/.test(s))throw Error('Introduce una cantidad válida.');let [w,f='']=s.split('.');if(f.length>d)throw Error('Demasiados decimales.');let n=BigInt(w)*10n**BigInt(d)+BigInt((f+'0'.repeat(d)).slice(0,d)||'0');if(n<=0n)throw Error('La cantidad debe ser mayor que cero.');return n}
+function set(id,msg,cls=''){let e=$(id);e.className='status '+cls;e.textContent=msg}
+async function rpc(method,params=[]){let r=await fetch($('rpc').value.trim(),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({jsonrpc:'2.0',id:1,method,params})});if(!r.ok)throw Error('HTTP '+r.status);let j=await r.json();if(j.error)throw Error(j.error.message+' ('+j.error.code+')');return j.result}
+async function waitReceipt(hash){for(let i=0;i<90;i++){let r=await rpc('eth_getTransactionReceipt',[hash]);if(r){if(r.status==='0x1')return r;throw Error('La transacción fue minada con status '+r.status)}await new Promise(res=>setTimeout(res,2000))}throw Error('Tiempo agotado esperando el recibo. Consulta el hash en los logs de Railway; no vuelvas a enviar la transacción automáticamente.')}
+async function getAllowance(){const data='0xdd62ed3e'+addr(account)+addr(ROUTER);return BigInt(await rpc('eth_call',[{to:USDT,data},'latest']))}
+async function requireNetwork(){if(!window.ethereum)throw Error('No se detectó MetaMask. Abre el archivo en el navegador de MetaMask.');const chain=await window.ethereum.request({method:'eth_chainId'});if(chain!=='0x1')throw Error('MetaMask no está en Chain ID 1. Selecciona tu red personalizada de Railway antes de continuar.');}
+function requireAccount(){if(!account)throw Error('Primero pulsa Conectar MetaMask.')}
+$('connect').onclick=async()=>{try{if(!window.ethereum)throw Error('Abre esta página en MetaMask Browser o un navegador con MetaMask.');let a=await window.ethereum.request({method:'eth_requestAccounts'});account=a[0];let c=await window.ethereum.request({method:'eth_chainId'});set('conn','Cuenta: '+account+' · Chain ID '+c+'. Verifica que la red seleccionada usa el RPC de Railway.','good')}catch(e){set('conn',e.message||String(e),'bad')}};
+$('check').onclick=async()=>{try{let [chain,client,block]=await Promise.all([rpc('eth_chainId'),rpc('web3_clientVersion'),rpc('eth_blockNumber')]);set('conn','RPC Railway: '+client+' · Chain ID '+chain+' · bloque '+BigInt(block).toString()+'.','good')}catch(e){set('conn',e.message||String(e),'bad')}};
+$('quote').onclick=async()=>{try{let a=parseUnits($('amount').value,6);let data=QUOTE_SEL+addr(USDT)+addr(WETH)+pad(a.toString(16))+pad('bb8')+pad('0');let res=await rpc('eth_call',[{to:QUOTER,data},'latest']);let body=res.slice(2);if(body.length<64)throw Error('Respuesta incompleta del cotizador.');quoteRaw=BigInt('0x'+body.slice(0,64));quoteAmountRaw=a;quoteAt=Date.now();let min=quoteRaw*(10000n-BigInt($('slippage').value))/10000n; $('out').textContent=units(quoteRaw,18)+' WETH';$('minout').textContent=units(min,18)+' WETH';set('qstatus','Cotización obtenida directamente del Quoter V2. Caduca localmente a los 2 minutos; vuelve a cotizar antes de ejecutar.','good');$('swap').disabled=true}catch(e){quoteRaw=null;set('qstatus',e.message||String(e),'bad')}};
+$('approve').onclick=async()=>{try{requireAccount();await requireNetwork();let amount=parseUnits($('amount').value,6);if(!window.confirm('Vas a aprobar exactamente '+$('amount').value+' USDT para el router Uniswap V3 en la red seleccionada. Esta red usa Chain ID 1 y podría confundirse con Mainnet. ¿Confirmas que la cuenta no tiene activos reales en Mainnet y que MetaMask está conectada al RPC de Railway?'))return;let data=APPROVE_SEL+addr(ROUTER)+pad(amount.toString(16));set('astatus','Esperando confirmación explícita en MetaMask…');let hash=await window.ethereum.request({method:'eth_sendTransaction',params:[{from:account,to:USDT,data,value:'0x0'}]});set('astatus','Transacción enviada: '+hash+'. Esperando recibo…');await waitReceipt(hash);approvalAmountRaw=await getAllowance();set('astatus','Recibo confirmado. Allowance actual: '+units(approvalAmountRaw,6)+' USDT.','good');if(quoteRaw&&quoteAmountRaw===amount&&Date.now()-quoteAt<120000&&approvalAmountRaw>=amount)$('swap').disabled=false}catch(e){set('astatus',e.message||String(e),'bad')}};
+$('swap').onclick=async()=>{try{requireAccount();await requireNetwork();if(!quoteRaw||!quoteAmountRaw)throw Error('Consulta una cotización primero.');if(Date.now()-quoteAt>120000)throw Error('La cotización tiene más de 2 minutos. Vuelve a consultar.');let amount=parseUnits($('amount').value,6);if(amount!==quoteAmountRaw)throw Error('Cambiaste la cantidad. Vuelve a consultar la cotización.');let allowance=await getAllowance();if(allowance<amount)throw Error('La autorización es inferior a la cantidad. Pulsa Aprobar cantidad exacta.');let min=quoteRaw*(10000n-BigInt($('slippage').value))/10000n;let data=SWAP_SEL+addr(USDT)+addr(WETH)+pad('bb8')+addr(account)+pad(amount.toString(16))+pad(min.toString(16))+pad('0');if(!window.confirm('Solicitar intercambio de '+$('amount').value+' USDT por WETH. Salida mínima '+units(min,18)+' WETH. MetaMask abrirá la confirmación. Verifica de nuevo que la red seleccionada sea el RPC de Railway.'))return;set('sstatus','Esperando confirmación explícita en MetaMask…');let hash=await window.ethereum.request({method:'eth_sendTransaction',params:[{from:account,to:ROUTER,data,value:'0x0'}]});set('sstatus','Transacción enviada: '+hash+'. Esperando recibo…');let receipt=await waitReceipt(hash);set('sstatus','Intercambio confirmado. Hash: '+hash+' · bloque '+BigInt(receipt.blockNumber).toString()+'. Verifica los balances después de la transacción.','good');$('swap').disabled=true}catch(e){set('sstatus',e.message||String(e),'bad')}};
+$('amount').addEventListener('input',()=>{$('swap').disabled=true;quoteRaw=null;quoteAmountRaw=null;set('qstatus','Cantidad modificada. Consulta una cotización nueva antes de continuar.')});
+$('slippage').addEventListener('change',()=>{$('swap').disabled=true;quoteAt=0;set('qstatus','Deslizamiento modificado. Consulta una cotización nueva antes de continuar.')});
+})();
+</script></body></html>
