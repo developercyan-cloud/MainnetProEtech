@@ -272,50 +272,31 @@ app.post("/admin/transfer-usdt", adminLimiter, requireAdmin, async (req, res) =>
       throw new Error("Anvil returned an invalid transaction hash");
     }
 
-    const receipt = await rpc("eth_getTransactionReceipt", [txHash]);
 
-    if (!receipt || receipt.status !== "0x1") {
-      let replayReason = "Simulation did not provide a revert reason";
+    let receipt = null;
 
-      try {
-        const replayBlock =
-          receipt?.blockNumber && BigInt(receipt.blockNumber) > 0n
-            ? toBeHex(BigInt(receipt.blockNumber) - 1n)
-            : "latest";
+    for (let attempt = 0; attempt < 30; attempt++) {
+      receipt = await rpc("eth_getTransactionReceipt", [txHash]);
 
-        await rpc("eth_call", [{
-          from,
-          to: USDT,
-          data,
-          value: "0x0",
-          gas: "0x186a0",
-          gasPrice
-        }, replayBlock]);
+      if (receipt !== null) break;
 
-        replayReason =
-          "Replay succeeded; inspect receipt status and gas usage";
-      } catch (replayErr) {
-        replayReason = String(
-          replayErr.message || "Simulation failed"
-        ).slice(0, 300);
-      }
+      await sleep(500);
+    }
 
-      const diagnostic = {
-        event: "USDT_TRANSFER_DIAGNOSTIC",
-        txHash,
-        receiptStatus: receipt?.status ?? null,
-        blockNumber: receipt?.blockNumber ?? null,
-        gasUsed: receipt?.gasUsed ?? null,
-        replayReason
-      };
-
-      console.error(JSON.stringify(diagnostic));
-
+    if (!receipt) {
       throw new Error(
-        `USDT fork transfer failed; diagnostic=${JSON.stringify(diagnostic)}`
+        `Transaction receipt not available after 15 seconds. txHash=${txHash}`
       );
     }
 
+    if (receipt.status !== "0x1") {
+      throw new Error(
+        `USDT transaction reverted. txHash=${txHash}, status=${receipt.status}`
+      );
+    }
+
+
+    
     const transferTopic = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
     const expectedFromTopic = "0x" + from.slice(2).padStart(64, "0");
     const expectedToTopic = "0x" + to.slice(2).padStart(64, "0");
