@@ -30,6 +30,12 @@ if (!ADMIN_TOKEN || ADMIN_TOKEN.length < 32) {
   process.exit(1);
 }
 fs.mkdirSync(DATA_DIR, { recursive: true });
+// Ensure the persistent audit file exists on every startup without truncating it.
+// Keep existing records intact; use restrictive permissions for transfer metadata.
+const auditFd = fs.openSync(TRANSFER_LOG_FILE, "a", 0o600);
+fs.closeSync(auditFd);
+try { fs.chmodSync(TRANSFER_LOG_FILE, 0o600); }
+catch (err) { console.error("TRANSFER_AUDIT_PERMISSION_WARNING:", err.message); }
 const transferRecords = new Map();
 
 function loadTransferAudit() {
@@ -48,9 +54,10 @@ function loadTransferAudit() {
   }
 }
 function appendTransferAudit(record) {
-  const line = JSON.stringify({ ...record, updatedAt: new Date().toISOString() }) + "\n";
+  const savedRecord = { ...record, updatedAt: new Date().toISOString() };
+  const line = JSON.stringify(savedRecord) + "\n";
   fs.appendFileSync(TRANSFER_LOG_FILE, line, { mode: 0o600 });
-  transferRecords.set(record.idempotencyHash, { ...record, updatedAt: new Date().toISOString() });
+  transferRecords.set(savedRecord.idempotencyHash, savedRecord);
 }
 function hashIdempotencyKey(key) {
   return createHash("sha256").update(key).digest("hex");
@@ -122,7 +129,7 @@ app.use(express.json({ limit: "256kb", strict: true }));
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization,Idempotency-Key");
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
 });
