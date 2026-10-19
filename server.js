@@ -258,16 +258,64 @@ app.post("/admin/transfer-usdt", adminLimiter, requireAdmin, async (req, res) =>
     await rpc("anvil_impersonateAccount", [from]);
     impersonating = true;
     const gasPrice = await rpc("eth_gasPrice", []);
+    
     const txHash = await rpc("eth_sendTransaction", [{
-      from, to: USDT, data, value: "0x0", gas: "0x186a0", gasPrice
+      from,
+      to: USDT,
+      data,
+      value: "0x0",
+      gas: "0x186a0",
+      gasPrice
     }]);
+
     if (typeof txHash !== "string" || !/^0x[0-9a-fA-F]{64}$/.test(txHash)) {
       throw new Error("Anvil returned an invalid transaction hash");
     }
+
     const receipt = await rpc("eth_getTransactionReceipt", [txHash]);
+
     if (!receipt || receipt.status !== "0x1") {
-      throw new Error("USDT transfer failed on the Anvil fork; receipt status was not successful");
+      let replayReason = "Simulation did not provide a revert reason";
+
+      try {
+        const replayBlock =
+          receipt?.blockNumber && BigInt(receipt.blockNumber) > 0n
+            ? toBeHex(BigInt(receipt.blockNumber) - 1n)
+            : "latest";
+
+        await rpc("eth_call", [{
+          from,
+          to: USDT,
+          data,
+          value: "0x0",
+          gas: "0x186a0",
+          gasPrice
+        }, replayBlock]);
+
+        replayReason =
+          "Replay succeeded; inspect receipt status and gas usage";
+      } catch (replayErr) {
+        replayReason = String(
+          replayErr.message || "Simulation failed"
+        ).slice(0, 300);
+      }
+
+      const diagnostic = {
+        event: "USDT_TRANSFER_DIAGNOSTIC",
+        txHash,
+        receiptStatus: receipt?.status ?? null,
+        blockNumber: receipt?.blockNumber ?? null,
+        gasUsed: receipt?.gasUsed ?? null,
+        replayReason
+      };
+
+      console.error(JSON.stringify(diagnostic));
+
+      throw new Error(
+        `USDT fork transfer failed; diagnostic=${JSON.stringify(diagnostic)}`
+      );
     }
+
     const transferTopic = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
     const expectedFromTopic = "0x" + from.slice(2).padStart(64, "0");
     const expectedToTopic = "0x" + to.slice(2).padStart(64, "0");
