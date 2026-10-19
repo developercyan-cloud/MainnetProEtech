@@ -5,6 +5,7 @@ import { AbiCoder, keccak256, isAddress, toBeHex, zeroPadValue } from "ethers";
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import { createHash } from "node:crypto";
 
 const PORT = Number(process.env.PORT || 3000);
 const ANVIL_HOST = process.env.ANVIL_HOST || "127.0.0.1";
@@ -13,6 +14,7 @@ const CHAIN_ID = Number(process.env.CHAIN_ID || 31337);
 const DATA_DIR = process.env.DATA_DIR || "/data";
 const STATE_FILE = path.join(DATA_DIR, "anvil-state.json");
 const MANUAL_SNAPSHOT_FILE = path.join(DATA_DIR, "manual-anvil-dump.json");
+const TRANSFER_LOG_FILE = path.join(DATA_DIR, "usdt-transfer-audit.jsonl");
 const FORK_URL = process.env.ETHEREUM_RPC_URL;
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN;
 const USDT = "0xdAC17F958D2ee523a2206206994597C13D831ec7";
@@ -28,9 +30,43 @@ if (!ADMIN_TOKEN || ADMIN_TOKEN.length < 32) {
   process.exit(1);
 }
 fs.mkdirSync(DATA_DIR, { recursive: true });
+const transferRecords = new Map();
+
+function loadTransferAudit() {
+  if (!fs.existsSync(TRANSFER_LOG_FILE)) return;
+  const lines = fs.readFileSync(TRANSFER_LOG_FILE, "utf8").split("\n");
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    try {
+      const record = JSON.parse(line);
+      if (record && typeof record.idempotencyHash === "string") {
+        transferRecords.set(record.idempotencyHash, record);
+      }
+    } catch (err) {
+      console.error("TRANSFER_AUDIT_CORRUPT_LINE: ignored an unreadable audit entry:", err.message);
+    }
+  }
+}
+function appendTransferAudit(record) {
+  const line = JSON.stringify({ ...record, updatedAt: new Date().toISOString() }) + "\n";
+  fs.appendFileSync(TRANSFER_LOG_FILE, line, { mode: 0o600 });
+  transferRecords.set(record.idempotencyHash, { ...record, updatedAt: new Date().toISOString() });
+}
+function hashIdempotencyKey(key) {
+  return createHash("sha256").update(key).digest("hex");
+}
+function httpError(status, code, message, details = {}) {
+  const error = new Error(message);
+  error.httpStatus = status;
+  error.code = code;
+  error.details = details;
+  return error;
+}
+loadTransferAudit();
 
 let anvil;
 let shuttingDown = false;
+let transferInProgress = false;
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 function startAnvil() {
@@ -43,15 +79,7 @@ function startAnvil() {
     "--state-interval", "1",
     "--silent"
   ];
-
-  console.log(`Starting Anvil with persistent state file ${STATE_FILE}`);
-  console.log("Anvil state save interval configured to 1 second.");
-
   anvil = spawn("anvil", args, { stdio: ["ignore", "inherit", "inherit"] });
-  anvil.on("error", err => {
-    console.error("Failed to start Anvil:", err.message);
-    if (!shuttingDown) process.exit(1);
-  });
   anvil.on("exit", (code, signal) => {
     console.error(`Anvil exited (code=${code}, signal=${signal})`);
     if (!shuttingDown) process.exit(1);
@@ -76,7 +104,8 @@ async function waitForAnvil() {
     try {
       const id = await rpc("eth_chainId");
       if (Number.parseInt(id, 16) === CHAIN_ID) {
-        console.log(`Anvil ready. Persistent state: ${STATE_FILE}`);
+        // Do not automatically load MANUAL_SNAPSHOT_FILE here. A manual snapshot
+        // may be older than STATE_FILE and would rewind the chain on every restart.
         return;
       }
     } catch {}
@@ -142,7 +171,7 @@ app.get("/", (_req, res) => res.json({
   network: "isolated-ethereum-mainnet-fork",
   usdt: USDT,
   warning: "TEST NETWORK ONLY. Fork balances are not real or transferable USDT.",
-  endpoints: { rpc: "/rpc", health: "/health", admin: "/admin/fund-usdt", transfer: "/admin/transfer-usdt" }
+  endpoints: { rpc: "/rpc", health: "/health", admin: "/admin/fund-usdt", transfer: "/admin/transfer-usdt", transferStatus: "/admin/transfer-status" }
 }));
 
 app.get("/health", async (_req, res) => {
@@ -167,7 +196,9 @@ app.post("/rpc", publicLimiter, async (req, res) => {
   if (Array.isArray(payload)) {
     if (payload.length > 20) return res.status(400).json(rpcError(null, -32600, "Batch too large"));
     const results = [];
-    for (const item of payload) results.push(await handlePublicRpcItem(item));
+    for (const item of payload) {
+      results.push(await handlePublicRpcItem(item));
+    }
     return res.json(results);
   }
   const result = await handlePublicRpcItem(payload);
@@ -219,88 +250,178 @@ async function tokenBalanceRaw(address) {
 
 app.post("/admin/transfer-usdt", adminLimiter, requireAdmin, async (req, res) => {
   let impersonating = false;
+  let from = "";
+  let to = "";
+  let amountRaw = 0n;
+  let txHash = null;
+  let idempotencyHash = null;
+  let fingerprint = null;
+  let submissionStarted = false;
+  let auditRecord = null;
+  let transferLockHeld = false;
+
   try {
-    const { fromAddress, toAddress, amount, chainId } = req.body || {};
+    const { fromAddress, toAddress, amount, chainId, requestId } = req.body || {};
+    const idempotencyKey = String(req.get("Idempotency-Key") || requestId || "").trim();
+    if (!/^[A-Za-z0-9._:-]{8,128}$/.test(idempotencyKey)) {
+      throw httpError(400, "IDEMPOTENCY_KEY_REQUIRED",
+        "Provide an Idempotency-Key header or requestId (8–128 characters). Reuse the same key only when retrying the same operation.");
+    }
     if (CHAIN_ID !== 1 || Number(chainId) !== 1) {
-      return res.status(409).json({ error: "This endpoint only permits test transfers on the configured Chain ID 1 fork." });
+      throw httpError(409, "CHAIN_ID_MISMATCH",
+        "This endpoint only permits test transfers on a fork configured with Chain ID 1. No transaction was submitted.",
+        { configuredChainId: CHAIN_ID, requestedChainId: chainId ?? null });
     }
-    
-  const validEthereumAddress = (value) =>
-    typeof value === "string" &&
-    /^0x[0-9a-fA-F]{40}$/.test(value.trim());
+    if (!isAddress(fromAddress)) {
+      throw httpError(400, "INVALID_SENDER_ADDRESS", "fromAddress is not a valid Ethereum address.");
+    }
+    if (!isAddress(toAddress)) {
+      throw httpError(400, "INVALID_RECIPIENT_ADDRESS", "toAddress is not a valid Ethereum address.");
+    }
+    from = fromAddress.toLowerCase();
+    to = toAddress.toLowerCase();
+    if (from === to) {
+      throw httpError(400, "SENDER_EQUALS_RECIPIENT", "Sender and recipient must be different addresses.");
+    }
+    try { amountRaw = amountRawGuard(amount); }
+    catch (err) { throw httpError(400, "INVALID_AMOUNT", err.message); }
+    if (amountRaw <= 0n) {
+      throw httpError(400, "INVALID_AMOUNT", "Transfer amount must be greater than zero.");
+    }
 
-  if (
-    !validEthereumAddress(fromAddress) ||
-    !validEthereumAddress(toAddress)
-  ) {
-    return res.status(400).json({
-      error: "Invalid sender or recipient Ethereum address"
-    });
-  }
+    fingerprint = createHash("sha256").update(JSON.stringify({
+      chainId: 1, from, to, amountRaw: amountRaw.toString(), token: USDT.toLowerCase()
+    })).digest("hex");
+    idempotencyHash = hashIdempotencyKey(idempotencyKey);
+    const previous = transferRecords.get(idempotencyHash);
+    if (previous) {
+      if (previous.fingerprint !== fingerprint) {
+        throw httpError(409, "IDEMPOTENCY_KEY_REUSED",
+          "This idempotency key is already associated with a different transfer. Use a new key for a new operation.");
+      }
+      if (previous.status === "confirmed" && previous.response) {
+        return res.status(200).json({ ...previous.response, replayed: true });
+      }
+      throw httpError(409, "TRANSFER_ALREADY_PROCESSED_OR_UNCERTAIN",
+        "This request key has already been processed or has an uncertain outcome. No second transfer was submitted. Check the saved txHash/audit record before taking action.",
+        { operationStatus: previous.status, txHash: previous.txHash || null, updatedAt: previous.updatedAt || null });
+    }
+    if (transferInProgress) {
+      throw httpError(409, "TRANSFER_BUSY", "Another USDT transfer is currently being processed. Wait for its result before starting another operation.");
+    }
+    transferInProgress = true;
+    transferLockHeld = true;
 
-  const from = fromAddress.trim().toLowerCase();
-  const to = toAddress.trim().toLowerCase();
-
-    const amountRaw = amountRawGuard(amount);
-    if (amountRaw <= 0n) return res.status(400).json({ error: "Transfer amount must be greater than zero" });
-
-    const balanceBefore = await tokenBalanceRaw(from);
+    let balanceBefore;
+    try { balanceBefore = await tokenBalanceRaw(from); }
+    catch (err) { throw httpError(503, "TOKEN_BALANCE_CHECK_FAILED", "Could not read the sender's virtual USDT balance from Anvil.", { cause: err.message }); }
     if (balanceBefore < amountRaw) {
-      return res.status(400).json({ error: "Insufficient virtual USDT balance on the MainNet Lab fork" });
+      throw httpError(400, "INSUFFICIENT_VIRTUAL_USDT",
+        "The sender does not have enough virtual USDT on this Anvil fork.",
+        { availableRaw: balanceBefore.toString(), requiredRaw: amountRaw.toString(), decimals: USDT_DECIMALS });
     }
+
+    let recipientBalanceBefore;
+    try { recipientBalanceBefore = await tokenBalanceRaw(to); }
+    catch (err) { throw httpError(503, "RECIPIENT_BALANCE_CHECK_FAILED", "Could not read the recipient's virtual USDT balance from Anvil.", { cause: err.message }); }
 
     const nativeBefore = BigInt(await rpc("eth_getBalance", [from, "latest"]));
     if (nativeBefore < 10n ** 16n) {
       await rpc("anvil_setBalance", [from, hexWord(5n * 10n ** 18n)]);
     }
 
+    // Persist intent before any transaction submission. This also prevents a retry
+    // after a process crash from blindly submitting the same operation twice.
+    auditRecord = {
+      idempotencyHash, fingerprint, status: "prepared", from, to,
+      token: USDT, amountRaw: amountRaw.toString(), chainId: 1,
+      balanceBeforeRaw: balanceBefore.toString(), recipientBalanceBeforeRaw: recipientBalanceBefore.toString(),
+      txHash: null, response: null
+    };
+    appendTransferAudit(auditRecord);
+
     const data = "0xa9059cbb" + to.slice(2).padStart(64, "0") + amountRaw.toString(16).padStart(64, "0");
     await rpc("anvil_impersonateAccount", [from]);
     impersonating = true;
     const gasPrice = await rpc("eth_gasPrice", []);
-    
- 
-    const txHash = await rpc("eth_sendTransaction", [{
-      from,
-      to: USDT,
-      data,
-      value: "0x0",
-      gas: "0x186a0",
-      gasPrice
-    }]);
+    auditRecord = { ...auditRecord, status: "submitting" };
+    appendTransferAudit(auditRecord);
+    submissionStarted = true;
 
-    if (typeof txHash !== "string" || !/^0x[0-9a-fA-F]{64}$/.test(txHash)) {
-      throw new Error("Anvil returned an invalid transaction hash");
+    try {
+      txHash = await rpc("eth_sendTransaction", [{
+        from, to: USDT, data, value: "0x0", gas: "0x186a0", gasPrice
+      }]);
+    } catch (err) {
+      auditRecord = { ...auditRecord, status: "outcome_unknown", errorCode: "SEND_RESULT_UNKNOWN", error: err.message };
+      appendTransferAudit(auditRecord);
+      throw httpError(503, "SEND_RESULT_UNKNOWN",
+        "Anvil did not return a definite response to transaction submission. The outcome is unknown; do not retry with a new key until you inspect the audit log and chain state.",
+        { cause: err.message });
     }
-
-    // Solicitar a Anvil que mine un bloque con las transacciones pendientes.
-    await rpc("anvil_mine", ["0x1"]);
+    if (typeof txHash !== "string" || !/^0x[0-9a-fA-F]{64}$/.test(txHash)) {
+      auditRecord = { ...auditRecord, status: "outcome_unknown", errorCode: "INVALID_TX_HASH" };
+      appendTransferAudit(auditRecord);
+      throw httpError(502, "INVALID_TX_HASH", "Anvil returned an invalid transaction hash; submission outcome requires manual review.");
+    }
+    auditRecord = { ...auditRecord, status: "submitted", txHash };
+    appendTransferAudit(auditRecord);
 
     let receipt = null;
-
-    for (let attempt = 0; attempt < 30; attempt++) {
+    for (let attempt = 0; attempt < 20; attempt++) {
       receipt = await rpc("eth_getTransactionReceipt", [txHash]);
-
       if (receipt) break;
-
       await sleep(500);
     }
-
     if (!receipt) {
-      throw new Error(
-        `Receipt unavailable after mining. txHash=${txHash}`
-      );
+      // Mine once as a recovery measure, then poll again. This is not considered
+      // proof of success; the receipt and Transfer event still must be verified.
+      try { await rpc("anvil_mine", ["0x1"]); }
+      catch (err) { console.warn("TRANSFER_RECOVERY_MINE_FAILED:", err.message); }
+      for (let attempt = 0; attempt < 20; attempt++) {
+        receipt = await rpc("eth_getTransactionReceipt", [txHash]);
+        if (receipt) break;
+        await sleep(500);
+      }
+    }
+    if (!receipt) {
+      auditRecord = { ...auditRecord, status: "receipt_pending", txHash, errorCode: "RECEIPT_UNAVAILABLE" };
+      appendTransferAudit(auditRecord);
+      throw httpError(504, "RECEIPT_UNAVAILABLE",
+        "Transaction hash was created, but Anvil did not return a receipt after polling and one mining attempt. The transfer is unconfirmed; do not submit it again.",
+        { txHash });
+    }
+    if (String(receipt.status).toLowerCase() !== "0x1") {
+      auditRecord = { ...auditRecord, status: "reverted", txHash, blockNumber: receipt.blockNumber || null, receiptStatus: receipt.status || null };
+      appendTransferAudit(auditRecord);
+      throw httpError(422, "TRANSACTION_REVERTED", "The transaction was mined but reverted. No successful USDT transfer was verified.",
+        { txHash, blockNumber: receipt.blockNumber || null, receiptStatus: receipt.status || null });
     }
 
-    if (receipt.status !== "0x1") {
-      throw new Error(
-        `Transaction reverted. txHash=${txHash}, status=${receipt.status}`
-      );
+    const tx = await rpc("eth_getTransactionByHash", [txHash]);
+    if (!tx) {
+      auditRecord = { ...auditRecord, status: "receipt_inconsistent", txHash, blockNumber: receipt.blockNumber || null };
+      appendTransferAudit(auditRecord);
+      throw httpError(502, "TRANSACTION_LOOKUP_INCONSISTENT", "A successful receipt was returned, but the transaction lookup returned null. Result requires review.", { txHash });
+    }
+    if (String(tx.from || "").toLowerCase() !== from || String(tx.to || "").toLowerCase() !== USDT.toLowerCase() ||
+        String(receipt.transactionHash || "").toLowerCase() !== txHash.toLowerCase()) {
+      auditRecord = { ...auditRecord, status: "receipt_mismatch", txHash, blockNumber: receipt.blockNumber || null };
+      appendTransferAudit(auditRecord);
+      throw httpError(502, "RECEIPT_TRANSACTION_MISMATCH", "Receipt transaction details do not match the requested sender and USDT contract.", { txHash });
+    }
+    const block = await rpc("eth_getBlockByHash", [receipt.blockHash, false]);
+    const blockContainsTransaction = Array.isArray(block?.transactions) && block.transactions.some(item =>
+      String(typeof item === "string" ? item : item?.hash || "").toLowerCase() === txHash.toLowerCase());
+    if (!block || String(block.hash || "").toLowerCase() !== String(receipt.blockHash || "").toLowerCase() ||
+        String(tx.blockHash || "").toLowerCase() !== String(receipt.blockHash || "").toLowerCase() ||
+        String(tx.blockNumber || "").toLowerCase() !== String(receipt.blockNumber || "").toLowerCase() ||
+        !blockContainsTransaction) {
+      auditRecord = { ...auditRecord, status: "block_verification_failed", txHash, blockNumber: receipt.blockNumber || null };
+      appendTransferAudit(auditRecord);
+      throw httpError(502, "BLOCK_VERIFICATION_FAILED", "The receipt's block could not be independently verified.", { txHash, blockNumber: receipt.blockNumber || null });
     }
 
-
-
-    
     const transferTopic = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
     const expectedFromTopic = "0x" + from.slice(2).padStart(64, "0");
     const expectedToTopic = "0x" + to.slice(2).padStart(64, "0");
@@ -311,28 +432,90 @@ app.post("/admin/transfer-usdt", adminLimiter, requireAdmin, async (req, res) =>
       String(log.topics?.[2] || "").toLowerCase() === expectedToTopic &&
       BigInt(log.data || "0x0") === amountRaw
     );
-    if (!validLog) throw new Error("Receipt did not contain the exact expected USDT Transfer event");
+    if (!validLog) {
+      auditRecord = { ...auditRecord, status: "transfer_event_missing", txHash, blockNumber: receipt.blockNumber || null };
+      appendTransferAudit(auditRecord);
+      throw httpError(422, "USDT_TRANSFER_EVENT_MISSING", "Receipt did not contain the exact USDT Transfer event for the requested sender, recipient and amount.", { txHash, blockNumber: receipt.blockNumber || null });
+    }
 
-    res.json({
+    const [balanceAfter, recipientBalanceAfter] = await Promise.all([tokenBalanceRaw(from), tokenBalanceRaw(to)]);
+    if (balanceAfter !== balanceBefore - amountRaw || recipientBalanceAfter !== recipientBalanceBefore + amountRaw) {
+      auditRecord = { ...auditRecord, status: "balance_verification_failed", txHash, blockNumber: receipt.blockNumber || null,
+        balanceAfterRaw: balanceAfter.toString(), recipientBalanceAfterRaw: recipientBalanceAfter.toString() };
+      appendTransferAudit(auditRecord);
+      throw httpError(502, "POST_TRANSFER_BALANCE_MISMATCH", "The Transfer event was found, but the final token balances do not match the expected exact debit and credit. Manual review is required.", { txHash });
+    }
+
+    const responseBody = {
       ok: true,
+      status: "confirmed",
       network: "ProEshop MainNet Lab Anvil fork only",
       chainId: CHAIN_ID,
       fromAddress: from,
       toAddress: to,
       token: USDT,
-      amount: String(amount),
+      decimals: USDT_DECIMALS,
+      amount: `${(amountRaw / 1000000n).toString()}.${(amountRaw % 1000000n).toString().padStart(6, "0")}`,
       txHash,
       blockNumber: receipt.blockNumber,
+      gasUsed: receipt.gasUsed || null,
+      auditLog: path.basename(TRANSFER_LOG_FILE),
       warning: "Test-only transfer on an isolated fork. No real USDT was sent on Ethereum Mainnet."
-    });
+    };
+    auditRecord = { ...auditRecord, status: "confirmed", txHash, blockNumber: receipt.blockNumber,
+      receiptStatus: receipt.status, gasUsed: receipt.gasUsed || null, response: responseBody,
+      balanceAfterRaw: balanceAfter.toString(), recipientBalanceAfterRaw: recipientBalanceAfter.toString() };
+    try {
+      appendTransferAudit(auditRecord);
+    } catch (err) {
+      console.error("TRANSFER_CONFIRMED_AUDIT_WRITE_FAILED:", { txHash, message: err.message });
+      return res.status(500).json({ error: { code: "TRANSFER_CONFIRMED_AUDIT_WRITE_FAILED", message: "The transfer was verified on the Anvil fork, but the final audit record could not be written. Do not retry this transfer.", txHash } });
+    }
+    return res.status(200).json(responseBody);
   } catch (err) {
-    res.status(400).json({ error: String(err.message || "Fork transfer failed").slice(0, 400) });
+    const status = Number.isInteger(err.httpStatus) ? err.httpStatus : (submissionStarted ? 503 : 500);
+    const code = err.code || (submissionStarted ? "TRANSFER_OUTCOME_REQUIRES_REVIEW" : "TRANSFER_INTERNAL_ERROR");
+    if (auditRecord && idempotencyHash && !["confirmed", "reverted", "receipt_pending", "outcome_unknown", "receipt_inconsistent", "receipt_mismatch", "block_verification_failed", "transfer_event_missing", "balance_verification_failed"].includes(auditRecord.status)) {
+      try {
+        appendTransferAudit({ ...auditRecord, status: submissionStarted ? "outcome_unknown" : "failed_before_submission",
+          errorCode: code, error: String(err.message || "Transfer failed").slice(0, 300), txHash: txHash || auditRecord.txHash || null });
+      } catch (auditErr) {
+        console.error("TRANSFER_AUDIT_WRITE_FAILED:", auditErr.message);
+      }
+    }
+    console.error("USDT_TRANSFER_ERROR:", { code, status, txHash, message: String(err.message || "Transfer failed") });
+    return res.status(status).json({ error: { code, message: String(err.message || "Transfer failed").slice(0, 500), ...(err.details || {}), ...(txHash ? { txHash } : {}) } });
   } finally {
-    if (impersonating) {
-      try { await rpc("anvil_stopImpersonatingAccount", [String(req.body?.fromAddress || "").toLowerCase()]); }
-      catch (err) { console.error("Could not stop Anvil account impersonation:", err.message); }
+    if (transferLockHeld) transferInProgress = false;
+    if (impersonating && from) {
+      try { await rpc("anvil_stopImpersonatingAccount", [from]); }
+      catch (err) { console.error("IMPERSONATION_CLEANUP_FAILED:", { address: from, message: err.message }); }
     }
   }
+});
+
+app.get("/admin/transfer-status", adminLimiter, requireAdmin, (req, res) => {
+  const idempotencyKey = String(req.get("Idempotency-Key") || req.query.requestId || "").trim();
+  if (!/^[A-Za-z0-9._:-]{8,128}$/.test(idempotencyKey)) {
+    return res.status(400).json({ error: { code: "IDEMPOTENCY_KEY_REQUIRED", message: "Provide the original Idempotency-Key header or requestId query parameter (8–128 characters)." } });
+  }
+  const record = transferRecords.get(hashIdempotencyKey(idempotencyKey));
+  if (!record) return res.status(404).json({ error: { code: "TRANSFER_NOT_FOUND", message: "No transfer audit record exists for this request key." } });
+  return res.json({
+    ok: true,
+    status: record.status,
+    txHash: record.txHash || null,
+    blockNumber: record.blockNumber || null,
+    fromAddress: record.from || null,
+    toAddress: record.to || null,
+    token: record.token || USDT,
+    amountRaw: record.amountRaw || null,
+    chainId: record.chainId || CHAIN_ID,
+    errorCode: record.errorCode || null,
+    updatedAt: record.updatedAt || null,
+    response: record.status === "confirmed" ? record.response : undefined,
+    warning: "This endpoint reports the saved Anvil-fork audit record; it does not represent Ethereum Mainnet settlement."
+  });
 });
 
 app.post("/admin/fund-usdt", adminLimiter, requireAdmin, async (req, res) => {
@@ -348,6 +531,9 @@ app.post("/admin/fund-usdt", adminLimiter, requireAdmin, async (req, res) => {
     const before = await tokenBalanceRaw(address);
     if (before !== target) {
       let funded = false;
+      // Probe likely mapping slots. Each failed candidate is restored immediately.
+      // This allows the exact, verified USDT contract on the fork to be tested
+      // without deploying a substitute token. It never writes to Ethereum Mainnet.
       for (let slotIndex = 0; slotIndex <= 40; slotIndex++) {
         const slot = mappingSlot(address, slotIndex);
         const previous = await rpc("eth_getStorageAt", [USDT, slot, "latest"]);
@@ -415,25 +601,22 @@ async function main() {
     console.log(`Chain ID ${CHAIN_ID}; state file ${STATE_FILE}`);
   });
 }
-
 async function shutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
-  console.log(`Received ${signal}; stopping services gracefully...`);
-
-  if (server) {
-    await new Promise(resolve => server.close(resolve));
+  console.log(`Received ${signal}; saving a manual Anvil snapshot...`);
+  try {
+    const state = await rpc("anvil_dumpState");
+    const tmp = `${MANUAL_SNAPSHOT_FILE}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify({ state, savedAt: new Date().toISOString() }, null, 2), { mode: 0o600 });
+    fs.renameSync(tmp, MANUAL_SNAPSHOT_FILE);
+  } catch (e) {
+    console.error("MANUAL_SNAPSHOT_SAVE_FAILED:", e.message);
   }
-
-  if (anvil && anvil.exitCode === null && anvil.signalCode === null) {
-    const exited = new Promise(resolve => anvil.once("exit", resolve));
-    anvil.kill("SIGTERM");
-    await Promise.race([exited, sleep(10000)]);
-  }
-
-  process.exit(0);
+  if (server) server.close();
+  if (anvil && !anvil.killed) anvil.kill("SIGTERM");
+  setTimeout(() => process.exit(0), 1500).unref();
 }
-
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("SIGINT", () => shutdown("SIGINT"));
 
