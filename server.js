@@ -259,6 +259,7 @@ app.post("/admin/transfer-usdt", adminLimiter, requireAdmin, async (req, res) =>
     impersonating = true;
     const gasPrice = await rpc("eth_gasPrice", []);
     
+ 
     const txHash = await rpc("eth_sendTransaction", [{
       from,
       to: USDT,
@@ -272,28 +273,31 @@ app.post("/admin/transfer-usdt", adminLimiter, requireAdmin, async (req, res) =>
       throw new Error("Anvil returned an invalid transaction hash");
     }
 
+    // Solicitar a Anvil que mine un bloque con las transacciones pendientes.
+    await rpc("anvil_mine", ["0x1"]);
 
     let receipt = null;
 
     for (let attempt = 0; attempt < 30; attempt++) {
       receipt = await rpc("eth_getTransactionReceipt", [txHash]);
 
-      if (receipt !== null) break;
+      if (receipt) break;
 
       await sleep(500);
     }
 
     if (!receipt) {
       throw new Error(
-        `Transaction receipt not available after 15 seconds. txHash=${txHash}`
+        `Receipt unavailable after mining. txHash=${txHash}`
       );
     }
 
     if (receipt.status !== "0x1") {
       throw new Error(
-        `USDT transaction reverted. txHash=${txHash}, status=${receipt.status}`
+        `Transaction reverted. txHash=${txHash}, status=${receipt.status}`
       );
     }
+
 
 
     
