@@ -40,10 +40,18 @@ function startAnvil() {
     "--host", ANVIL_HOST,
     "--port", String(ANVIL_PORT),
     "--state", STATE_FILE,
-    "--state-interval", "30",
+    "--state-interval", "1",
     "--silent"
   ];
+
+  console.log(`Starting Anvil with persistent state file ${STATE_FILE}`);
+  console.log("Anvil state save interval configured to 1 second.");
+
   anvil = spawn("anvil", args, { stdio: ["ignore", "inherit", "inherit"] });
+  anvil.on("error", err => {
+    console.error("Failed to start Anvil:", err.message);
+    if (!shuttingDown) process.exit(1);
+  });
   anvil.on("exit", (code, signal) => {
     console.error(`Anvil exited (code=${code}, signal=${signal})`);
     if (!shuttingDown) process.exit(1);
@@ -68,17 +76,7 @@ async function waitForAnvil() {
     try {
       const id = await rpc("eth_chainId");
       if (Number.parseInt(id, 16) === CHAIN_ID) {
-        if (fs.existsSync(MANUAL_SNAPSHOT_FILE)) {
-          try {
-            const saved = JSON.parse(fs.readFileSync(MANUAL_SNAPSHOT_FILE, "utf8"));
-            if (typeof saved.state === "string" && saved.state.startsWith("0x")) {
-              await rpc("anvil_loadState", [saved.state]);
-              console.log("Restored manual Anvil snapshot.");
-            }
-          } catch (e) {
-            console.error("Manual snapshot restore skipped:", e.message);
-          }
-        }
+        console.log(`Anvil ready. Persistent state: ${STATE_FILE}`);
         return;
       }
     } catch {}
@@ -169,9 +167,7 @@ app.post("/rpc", publicLimiter, async (req, res) => {
   if (Array.isArray(payload)) {
     if (payload.length > 20) return res.status(400).json(rpcError(null, -32600, "Batch too large"));
     const results = [];
-    for (const item of payload) {
-      results.push(await handlePublicRpcItem(item));
-    }
+    for (const item of payload) results.push(await handlePublicRpcItem(item));
     return res.json(results);
   }
   const result = await handlePublicRpcItem(payload);
@@ -236,13 +232,11 @@ app.post("/admin/transfer-usdt", adminLimiter, requireAdmin, async (req, res) =>
     const amountRaw = amountRawGuard(amount);
     if (amountRaw <= 0n) return res.status(400).json({ error: "Transfer amount must be greater than zero" });
 
-    // Verify the source has the requested virtual USDT balance before impersonation.
     const balanceBefore = await tokenBalanceRaw(from);
     if (balanceBefore < amountRaw) {
       return res.status(400).json({ error: "Insufficient virtual USDT balance on the MainNet Lab fork" });
     }
 
-    // Ensure gas exists only in the isolated Anvil state. This never changes Ethereum Mainnet.
     const nativeBefore = BigInt(await rpc("eth_getBalance", [from, "latest"]));
     if (nativeBefore < 10n ** 16n) {
       await rpc("anvil_setBalance", [from, hexWord(5n * 10n ** 18n)]);
@@ -253,12 +247,7 @@ app.post("/admin/transfer-usdt", adminLimiter, requireAdmin, async (req, res) =>
     impersonating = true;
     const gasPrice = await rpc("eth_gasPrice", []);
     const txHash = await rpc("eth_sendTransaction", [{
-      from,
-      to: USDT,
-      data,
-      value: "0x0",
-      gas: "0x186a0",
-      gasPrice
+      from, to: USDT, data, value: "0x0", gas: "0x186a0", gasPrice
     }]);
     if (typeof txHash !== "string" || !/^0x[0-9a-fA-F]{64}$/.test(txHash)) {
       throw new Error("Anvil returned an invalid transaction hash");
@@ -314,9 +303,6 @@ app.post("/admin/fund-usdt", adminLimiter, requireAdmin, async (req, res) => {
     const before = await tokenBalanceRaw(address);
     if (before !== target) {
       let funded = false;
-      // Probe likely mapping slots. Each failed candidate is restored immediately.
-      // This allows the exact, verified USDT contract on the fork to be tested
-      // without deploying a substitute token. It never writes to Ethereum Mainnet.
       for (let slotIndex = 0; slotIndex <= 40; slotIndex++) {
         const slot = mappingSlot(address, slotIndex);
         const previous = await rpc("eth_getStorageAt", [USDT, slot, "latest"]);
@@ -384,22 +370,25 @@ async function main() {
     console.log(`Chain ID ${CHAIN_ID}; state file ${STATE_FILE}`);
   });
 }
+
 async function shutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
-  console.log(`Received ${signal}; saving Anvil state...`);
-  try {
-    const state = await rpc("anvil_dumpState");
-    const tmp = `${STATE_FILE}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify({ state }, null, 2), { mode: 0o600 });
-    fs.renameSync(tmp, STATE_FILE);
-  } catch (e) {
-    console.error("Could not dump state during shutdown:", e.message);
+  console.log(`Received ${signal}; stopping services gracefully...`);
+
+  if (server) {
+    await new Promise(resolve => server.close(resolve));
   }
-  if (server) server.close();
-  if (anvil && !anvil.killed) anvil.kill("SIGTERM");
-  setTimeout(() => process.exit(0), 1500).unref();
+
+  if (anvil && anvil.exitCode === null && anvil.signalCode === null) {
+    const exited = new Promise(resolve => anvil.once("exit", resolve));
+    anvil.kill("SIGTERM");
+    await Promise.race([exited, sleep(10000)]);
+  }
+
+  process.exit(0);
 }
+
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("SIGINT", () => shutdown("SIGINT"));
 
