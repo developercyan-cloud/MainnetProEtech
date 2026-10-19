@@ -224,11 +224,23 @@ app.post("/admin/transfer-usdt", adminLimiter, requireAdmin, async (req, res) =>
     if (CHAIN_ID !== 1 || Number(chainId) !== 1) {
       return res.status(409).json({ error: "This endpoint only permits test transfers on the configured Chain ID 1 fork." });
     }
-    if (!isAddress(fromAddress) || !isAddress(toAddress)) {
-      return res.status(400).json({ error: "Invalid sender or recipient Ethereum address" });
-    }
-    const from = fromAddress.toLowerCase();
-    const to = toAddress.toLowerCase();
+    
+  const validEthereumAddress = (value) =>
+    typeof value === "string" &&
+    /^0x[0-9a-fA-F]{40}$/.test(value.trim());
+
+  if (
+    !validEthereumAddress(fromAddress) ||
+    !validEthereumAddress(toAddress)
+  ) {
+    return res.status(400).json({
+      error: "Invalid sender or recipient Ethereum address"
+    });
+  }
+
+  const from = fromAddress.trim().toLowerCase();
+  const to = toAddress.trim().toLowerCase();
+
     const amountRaw = amountRawGuard(amount);
     if (amountRaw <= 0n) return res.status(400).json({ error: "Transfer amount must be greater than zero" });
 
